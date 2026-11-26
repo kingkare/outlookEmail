@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows Semantic Versioning (`MAJOR.MINOR.PATCH`).
 
+## [Unreleased]
+
+## [3.0.35] - 2026-11-26
+
+### Added
+- 手动 OAuth 授权并保存新 Outlook 账号时支持填写备注，备注会随账号一并保存；重新授权已有账号会保留原备注。
+- 系统设置可配置分享链接公网地址；留空时继续根据当前请求地址自动生成。
+
+## [3.0.34] - 2026-11-26
+
+### Added
+- 邮件分享页在手机端支持切换收件箱和垃圾邮件；后台和分享页详情新增“标为非垃圾邮件”，可将邮件移回收件箱。
+- 分享链接可单独设置访客操作权限，默认只读；仅在明确开启后，访客才能执行移回收件箱操作。
+
+### Fixed
+- 邮件移回收件箱后清理本地保留缓存中的垃圾箱源行，避免旧邮件残留和“全部邮件”重复显示。
+- IMAP 搬移使用 APPEND 并保留原 INTERNALDATE；只有 EXPUNGE 成功才报告搬移完成，失败时返回错误并尝试恢复源邮件删除标记。
+- 分享页切换文件夹时同步手机标签和侧边栏选中状态。
+
 ## [3.0.33] - 2026-11-22
 
 ### Added
@@ -18,8 +37,6 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 ### Important
 - Microsoft 不保证每次刷新都返回新的 Refresh Token，应用也不能强制微软轮换。新版通过每日重复检查到期窗口、未轮换次日重试，以及在取信时保存轮换结果，增加及时获取并保存新令牌的机会，降低批量账号继续使用旧令牌而失效的风险。
 - 保存到期或停用模式后，旧策略永久退役；存量旧定时刷新开关已经关闭的实例也不能重新启用旧模式。到期刷新设置使用现有设置表，无需额外 SQL 脚本。
-
-## [Unreleased]
 
 ## [3.0.32] - 2026-11-17
 

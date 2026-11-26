@@ -36,6 +36,7 @@ class EmailShareLinkTests(unittest.TestCase):
             db = web_outlook_app.get_db()
             db.execute('DELETE FROM email_share_links')
             db.execute('DELETE FROM accounts')
+            db.execute("DELETE FROM settings WHERE key = 'email_share_public_base_url'")
             db.commit()
 
     def _insert_account(self, email_addr='shared@example.com'):
@@ -68,6 +69,52 @@ class EmailShareLinkTests(unittest.TestCase):
     def _token_from_share_url(self, share_url):
         return urlparse(share_url).path.rstrip('/').split('/')[-1]
 
+    def test_share_url_uses_request_host_by_default_and_configured_base_when_set(self):
+        account_id = self._insert_account()
+
+        default_response = self.client.post(
+            '/api/email-shares',
+            json={'account_id': account_id, 'duration_minutes': 60},
+        )
+        self.assertEqual(default_response.status_code, 200)
+        default_url = urlparse(default_response.get_json()['share']['share_url'])
+        self.assertEqual(default_url.scheme, 'http')
+        self.assertEqual(default_url.netloc, 'localhost')
+
+        settings_response = self.client.put('/api/settings', json={
+            'email_share_public_base_url': 'https://mail.example.test/',
+        })
+        self.assertTrue(settings_response.get_json()['success'])
+        settings = self.client.get('/api/settings').get_json()['settings']
+        self.assertEqual(settings['email_share_public_base_url'], 'https://mail.example.test')
+
+        configured_response = self.client.post(
+            '/api/email-shares',
+            json={'account_id': account_id, 'duration_minutes': 60},
+        )
+        self.assertEqual(configured_response.status_code, 200)
+        configured_url = urlparse(configured_response.get_json()['share']['share_url'])
+        self.assertEqual(configured_url.scheme, 'https')
+        self.assertEqual(configured_url.netloc, 'mail.example.test')
+
+    def test_share_public_base_url_rejects_non_origin_urls(self):
+        invalid_urls = (
+            'ftp://mail.example.test',
+            'https://mail.example.test/share',
+            'https://user:password@mail.example.test',
+            'https://mail.example.test?query=1',
+            'not-a-url',
+        )
+        for value in invalid_urls:
+            with self.subTest(value=value):
+                response = self.client.put('/api/settings', json={
+                    'email_share_public_base_url': value,
+                })
+                self.assertFalse(response.get_json()['success'])
+
+        settings = self.client.get('/api/settings').get_json()['settings']
+        self.assertEqual(settings['email_share_public_base_url'], '')
+
     @staticmethod
     def _share_folder_result(emails, method='Graph API', request_method='graph', has_more=False):
         return {
@@ -90,7 +137,7 @@ class EmailShareLinkTests(unittest.TestCase):
 
         return fetch
 
-    def test_email_share_schema_migrates_max_email_count_and_preserves_legacy_rows(self):
+    def test_email_share_schema_migrates_share_settings_and_preserves_legacy_rows(self):
         account_id = self._insert_account()
         legacy_token = 'legacy-share-token'
         with self.app.app_context():
@@ -138,13 +185,16 @@ class EmailShareLinkTests(unittest.TestCase):
                 for row in db.execute('PRAGMA table_info(email_share_links)').fetchall()
             }
             migrated_row = db.execute(
-                'SELECT max_email_count, access_code_hash FROM email_share_links WHERE token_hash = ?',
+                'SELECT max_email_count, access_code_hash, allow_actions '
+                'FROM email_share_links WHERE token_hash = ?',
                 (web_outlook_app.hash_email_share_token(legacy_token),)
             ).fetchone()
             self.assertIn('max_email_count', columns)
             self.assertIn('access_code_hash', columns)
+            self.assertIn('allow_actions', columns)
             self.assertIsNone(migrated_row['max_email_count'])
             self.assertIsNone(migrated_row['access_code_hash'])
+            self.assertEqual(migrated_row['allow_actions'], 0)
 
             web_outlook_app.init_db()
 
@@ -170,6 +220,7 @@ class EmailShareLinkTests(unittest.TestCase):
         for code in (None, ''):
             share = self._create_share(account_id, access_code=code)
             self.assertFalse(share['requires_access_code'])
+            self.assertFalse(share['allow_actions'])
         for code in ('a', 'abc', 'a' * 33, 'ab 12', '中文代码', 1234, True, [], {}):
             with self.subTest(code=code):
                 response = self.client.post('/api/email-shares', json={
@@ -178,6 +229,37 @@ class EmailShareLinkTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 400)
                 self.assertFalse(response.get_json()['success'])
         self._create_share(account_id, access_code='a' * 32)
+
+    def test_create_share_can_explicitly_allow_actions(self):
+        account_id = self._insert_account()
+
+        share = self._create_share(account_id, allow_actions=True)
+
+        self.assertTrue(share['allow_actions'])
+        listed = self.client.get('/api/email-shares').get_json()['shares'][0]
+        self.assertTrue(listed['allow_actions'])
+
+    def test_share_action_permission_can_be_toggled(self):
+        account_id = self._insert_account()
+        share = self._create_share(account_id)
+
+        enabled = self.client.post(
+            f"/api/email-shares/{share['id']}/allow-actions",
+            json={'allow_actions': True},
+        )
+        self.assertEqual(enabled.status_code, 200)
+        self.assertTrue(enabled.get_json()['share']['allow_actions'])
+
+        token = self._token_from_share_url(share['share_url'])
+        status = self.app.test_client().get(f'/api/share/email/{token}/status')
+        self.assertTrue(status.get_json()['allow_actions'])
+
+        disabled = self.client.post(
+            f"/api/email-shares/{share['id']}/allow-actions",
+            json={'allow_actions': False},
+        )
+        self.assertEqual(disabled.status_code, 200)
+        self.assertFalse(disabled.get_json()['share']['allow_actions'])
 
     def test_access_code_blocks_all_anonymous_read_routes_without_leaking_email(self):
         account_id = self._insert_account()
@@ -1176,6 +1258,21 @@ class EmailShareFrontendContractTests(unittest.TestCase):
         self.assertIn('emailShareRollingWarning', dialogs)
         self.assertIn('max_email_count: maxEmailCount', shares_js)
         self.assertIn('formatEmailShareVisibility', shares_js)
+        self.assertIn('emailShareAllowActions', dialogs)
+        self.assertIn('allow_actions: allowActions', shares_js)
+        self.assertIn('toggleEmailShareActions', shares_js)
+
+    def test_settings_ui_contains_optional_share_public_base_url(self):
+        dialogs = pathlib.Path(
+            ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html'
+        ).read_text(encoding='utf-8')
+        settings_js = pathlib.Path(
+            ROOT_DIR, 'static', 'js', 'index', '07-settings.js'
+        ).read_text(encoding='utf-8')
+
+        self.assertIn('id="settingsEmailSharePublicBaseUrl"', dialogs)
+        self.assertIn('email_share_public_base_url', settings_js)
+        self.assertIn('留空时按当前访问地址自动生成', dialogs)
 
     def test_admin_ui_formats_share_times_in_app_timezone(self):
         # 后端 expires_at/created_at 均为无时区标记的 UTC 字符串，
